@@ -1,0 +1,72 @@
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llava --input-mode thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --input-mode thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model llama3.2 --input-mode thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model internvl2 --input-mode thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model minicpm --input-mode thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb_thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb_thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb_thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb_thermal --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb  
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode rgb --repeat-prompt --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode thermal  
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode thermal  --no-temp-summary
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode thermal --repeat-prompt 
+python eval_vlm_checkpoint.py --input ./response_v16 --model pixtral --input-mode thermal --repeat-prompt --no-temp-summary

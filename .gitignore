@@ -1,0 +1,34 @@
+# Python / Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# VS Code settings
+.vscode/
+
+# Large Datasets and Media (Crucial for ML and Robotics)
+response_16/
+benchmark_results/
+internvl2_results/
+minicpm_results/
+pixtral_results/
+*.zip
+*.tar.gz
+*.mp4
+*.bag 
+
+# Machine Learning Model Weights
+*.pt
+*.pth
+*.h5
+*.onnx
+*.json
+# OS generated files
+.DS_Store
+Thumbs.db
