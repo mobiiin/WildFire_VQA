@@ -594,18 +594,34 @@ class GenericVLMRunner:
         if use_flash_attn2:
             model_kwargs["attn_implementation"] = "flash_attention_2"
 
+        # Llama 3.2 Vision: load in fp16 to avoid OOM during tile_embedding init.
+        # bitsandbytes 4-bit is skipped here because the CUDA lib may be unavailable.
+        is_llama_vision = "llama" in model_id.lower() and "vision" in model_id.lower()
+        if is_llama_vision and not load_4bit:
+            model_kwargs["torch_dtype"] = torch.float16
+            print("[INFO] Loading Llama Vision in float16 to reduce GPU memory usage.")
+
         if load_4bit:
-            from transformers import BitsAndBytesConfig
-            qconfig = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-            )
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                model_id,
-                quantization_config=qconfig,
-                **model_kwargs
-            )
+            try:
+                from transformers import BitsAndBytesConfig
+                import bitsandbytes as bnb
+                # Quick sanity check that the native CUDA lib is loaded
+                if getattr(bnb, "lib", None) is None:
+                    raise ImportError("bitsandbytes native CUDA lib not loaded")
+                qconfig = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                )
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    model_id,
+                    quantization_config=qconfig,
+                    **model_kwargs
+                )
+            except (ImportError, AttributeError) as bnb_err:
+                print(f"[WARN] bitsandbytes 4-bit unavailable ({bnb_err}); falling back to float16.")
+                model_kwargs["torch_dtype"] = torch.float16
+                self.model = AutoModelForImageTextToText.from_pretrained(model_id, **model_kwargs)
         else:
             self.model = AutoModelForImageTextToText.from_pretrained(model_id, **model_kwargs)
 
@@ -732,6 +748,13 @@ class VLLMRunner:
             llm_kwargs["max_model_len"] = int(max_model_len)
         if revision:
             llm_kwargs["revision"] = revision
+        if cfg.family == "llama":
+            # Mllama cross-attention encoder KV cache is proportional to visual tokens per image
+            # (25,616 tokens/image). With default max_num_seqs=256 vLLM pre-allocates gigabytes
+            # of encoder KV cache and OOMs before the profiling pass even completes.
+            # max_num_seqs=1 limits encoder KV reservation to a single sequence at a time.
+            llm_kwargs["max_num_seqs"] = 1
+            print("[INFO] Llama 3.2 Vision on vLLM: setting max_num_seqs=1 to avoid encoder KV cache OOM.")
         if cfg.family == "pixtral":
             llm_kwargs["tokenizer_mode"] = "mistral"
             print(
@@ -1270,16 +1293,41 @@ def main():
                 "for stability."
             )
 
-        runner = VLLMRunner(
-            cfg,
-            tensor_parallel_size=args.vllm_tensor_parallel_size,
-            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            max_model_len=(args.vllm_max_model_len if args.vllm_max_model_len > 0 else None),
-            enable_prefix_caching=not args.disable_vllm_prefix_caching,
-            use_chat_api=effective_use_chat_api,
-            allow_chat_fallback=(not bool(args.disable_vllm_chat_fallback)),
-            revision=args.model_revision,
-        )
+        # Llama 3.2 Vision with transformers backend will auto-enable 8-bit quantization in GenericVLMRunner
+        # to prevent OOM during model initialization (tile_embedding).
+        # We don't need to force backend switching - just stay on vLLM and let it fallback naturally.
+        
+        effective_gpu_memory_utilization = args.vllm_gpu_memory_utilization
+        effective_max_model_len = args.vllm_max_model_len if args.vllm_max_model_len > 0 else None
+        
+        runner = None
+        if args.backend == "vllm":
+            try:
+                runner = VLLMRunner(
+                    cfg,
+                    tensor_parallel_size=args.vllm_tensor_parallel_size,
+                    gpu_memory_utilization=effective_gpu_memory_utilization,
+                    max_model_len=effective_max_model_len,
+                    enable_prefix_caching=not args.disable_vllm_prefix_caching,
+                    use_chat_api=effective_use_chat_api,
+                    allow_chat_fallback=(not bool(args.disable_vllm_chat_fallback)),
+                    revision=args.model_revision,
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda out of memory" in str(e).lower():
+                    print(f"[WARN] vLLM initialization OOM for {cfg.model_id}. Falling back to transformers backend...")
+                    runner = None
+                else:
+                    raise
+        
+        if runner is None:
+            runner = VLMRunner(
+                cfg,
+                device=args.device,
+                load_4bit=args.load_4bit,
+                use_flash_attn2=args.use_flash_attn2,
+                revision=args.model_revision,
+            )
     else:
         runner = VLMRunner(
             cfg,
@@ -1290,6 +1338,7 @@ def main():
         )
 
     skip_missing_fields, skip_missing_files, exceptions, printed_ex = 0, 0, 0, 0
+    print(f"[INFO] Runner backend: {'vLLM' if isinstance(runner, VLLMRunner) else 'transformers'}")
     missing_examples: List[Tuple[str, str]] = []
     image_cache: Dict[str, Image.Image] = {}
     image_cache_size = max(0, int(args.image_cache_size))

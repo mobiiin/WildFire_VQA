@@ -350,8 +350,9 @@ for MODEL in "${MODELS[@]}"; do
                     CMD+=(
                         "--vllm-tensor-parallel-size" "$RUN_TP_SIZE"
                         "--vllm-batch-size" "1"
-                        "--vllm-max-model-len" "4096"
-                        "--vllm-gpu-memory-utilization" "0.65"
+                        "--vllm-max-model-len" "8192"
+                        "--vllm-gpu-memory-utilization" "0.75"
+                        "--disable-vllm-prefix-caching"
                     )
                 fi
 
