@@ -1,0 +1,2007 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Unified evaluator for checkpoint-style (and list-style) JSON datasets.
+
+Supports:
+- LLaVA v1.6 Mistral 7B: llava-hf/llava-v1.6-mistral-7b-hf
+- Qwen3-VL-8B-Instruct: Qwen/Qwen3-VL-8B-Instruct
+- Llama-3.2-11B-Vision-Instruct: meta-llama/Llama-3.2-11B-Vision-Instruct
+- InternVL2-8B: OpenGVLab/InternVL2-8B
+- MiniCPM-V-2_6: openbmb/MiniCPM-V-2_6
+- Pixtral-12B-2409: mistralai/Pixtral-12B-2409
+
+Notes:
+- Fixes thermal-summary leakage into RGB-only runs.
+- Fixes thermal-only mode requiring rgb_path.
+- Fixes inconsistent group totals when inference exceptions occur.
+- Adds safer row sampling fallback when image_id is missing.
+- Avoids forcing Pixtral into a broken/contradictory vLLM chat path.
+
+Usage:
+  python3 eval_vlm_checkpoint.py --input <json_or_dir> --model llava --outdir ./eval_out_llava
+  python3 eval_vlm_checkpoint.py --input <json_or_dir> --model qwen  --outdir ./eval_out_qwen
+"""
+
+import argparse
+import hashlib
+import inspect
+import json
+import logging
+import os
+import random
+import sys
+import tempfile
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import Qwen3VLForConditionalGeneration
+
+try:
+    from vllm import LLM, SamplingParams
+except Exception:
+    LLM = None
+    SamplingParams = None
+
+
+VLLM_CHAT_FIRST_FAMILIES = {"internvl", "minicpm"}
+VLLM_STRING_CHAT_TEMPLATE_FAMILIES = {"internvl", "minicpm"}
+EXIT_REQUESTED_VLLM_FALLBACK = 86
+ICL_SUPPORTED_FAMILIES = {"llava", "qwen"}
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+
+def safe_mkdir(d: str) -> None:
+    os.makedirs(d, exist_ok=True)
+
+
+def find_json_files(path: str) -> List[str]:
+    if os.path.isfile(path):
+        return [path]
+    return [os.path.join(path, fn) for fn in sorted(os.listdir(path)) if fn.lower().endswith(".json")]
+
+
+def load_json_any(path: str) -> Any:
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def is_header_line(_: Dict[str, Any]) -> bool:
+    return False
+
+
+def sample_images_and_expand(rows: List[Dict[str, Any]], percent: float, seed: int = 123):
+    if percent >= 1.0:
+        ids = sorted(set(str(r.get("image_id")) for r in rows if r.get("image_id") is not None))
+        return rows, set(ids)
+
+    rnd = random.Random(seed)
+    image_ids = sorted(set(str(r.get("image_id")) for r in rows if r.get("image_id") is not None))
+
+    if image_ids:
+        k = max(1, int(round(percent * len(image_ids))))
+        sampled = set(rnd.sample(image_ids, k=min(k, len(image_ids))))
+        sampled_rows = [r for r in rows if str(r.get("image_id")) in sampled]
+        return sampled_rows, sampled
+
+    # Fallback: if image_id is missing, sample rows directly instead of dropping everything.
+    if not rows:
+        return [], set()
+
+    k = max(1, int(round(percent * len(rows))))
+    sampled_rows = rnd.sample(rows, k=min(k, len(rows)))
+    sampled_ids = set(str(r.get("image_id")) for r in sampled_rows if r.get("image_id") is not None)
+    return sampled_rows, sampled_ids
+
+
+def norm(s: Any) -> str:
+    return str(s).strip().lower() if s is not None else ""
+
+
+def acc(correct: int, total: int) -> float:
+    return (correct / total) if total > 0 else 0.0
+
+
+def pick_device(requested: str) -> str:
+    req = (requested or "").lower().strip()
+    if req.startswith("cuda") or req == "gpu":
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return "cuda"
+        print("[WARN] CUDA initialization failed. Falling back to CPU.")
+    return "cpu"
+
+
+class _SuppressMessageFilter(logging.Filter):
+    def __init__(self, contains: str):
+        super().__init__()
+        self.contains = contains
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return self.contains not in msg
+
+
+def suppress_vllm_known_noisy_warnings() -> None:
+    noisy_substring = "intended overrides are not keyword"
+    root_logger = logging.getLogger("vllm")
+
+    for logger_name in [
+        "vllm",
+        "vllm.utils",
+        "vllm.utils.func_utils",
+    ]:
+        logger = logging.getLogger(logger_name)
+        if not any(
+            isinstance(f, _SuppressMessageFilter) and getattr(f, "contains", None) == noisy_substring
+            for f in logger.filters
+        ):
+            logger.addFilter(_SuppressMessageFilter(noisy_substring))
+
+    if not any(
+        isinstance(f, _SuppressMessageFilter) and getattr(f, "contains", None) == noisy_substring
+        for f in root_logger.filters
+    ):
+        root_logger.addFilter(_SuppressMessageFilter(noisy_substring))
+
+
+def _is_writable_dir(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+
+def _short_runtime_root(base_outdir: str, run_name: str) -> str:
+    """
+    Build a short, deterministic runtime directory so vLLM IPC socket paths stay
+    below the Unix domain socket length limit.
+    """
+    runtime_base = os.environ.get("FLAMEVQA_RUNTIME_ROOT")
+    if runtime_base:
+        runtime_base = os.path.abspath(runtime_base)
+    else:
+        runtime_base = os.path.join(tempfile.gettempdir(), "fvqa_rt")
+
+    safe_mkdir(runtime_base)
+    run_token = hashlib.sha1(f"{os.path.abspath(base_outdir)}::{run_name}".encode("utf-8")).hexdigest()[:12]
+    runtime_root = os.path.join(runtime_base, run_token)
+    safe_mkdir(runtime_root)
+    return runtime_root
+
+
+def prepare_writable_runtime_env(base_outdir: str, run_name: str) -> Dict[str, str]:
+    """
+    Ensure worker subprocesses inherit writable tmp/cache locations.
+    This avoids PermissionError crashes in Torch-Inductor/Triton cache writes
+    on HPC nodes where inherited SLURM scratch paths may be inaccessible.
+    Keep paths short because vLLM uses TMPDIR for IPC sockets with a hard Unix
+    socket path limit of roughly 107 bytes.
+    """
+    safe_mkdir(base_outdir)
+    runtime_root = _short_runtime_root(base_outdir, run_name)
+
+    tmp_dir = os.path.join(runtime_root, "t")
+    inductor_dir = os.path.join(runtime_root, "i")
+    triton_dir = os.path.join(runtime_root, "r")
+    xdg_cache_home = os.path.join(runtime_root, "x")
+    for d in [tmp_dir, inductor_dir, triton_dir, xdg_cache_home]:
+        safe_mkdir(d)
+
+    updated: Dict[str, str] = {}
+    updated["FLAMEVQA_RUNTIME_ROOT"] = runtime_root
+
+    current_tmp = os.environ.get("TMPDIR")
+    if not _is_writable_dir(current_tmp):
+        os.environ["TMPDIR"] = tmp_dir
+        tempfile.tempdir = tmp_dir
+        updated["TMPDIR"] = tmp_dir
+
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_dir
+    os.environ["TRITON_CACHE_DIR"] = triton_dir
+    os.environ.setdefault("XDG_CACHE_HOME", xdg_cache_home)
+    updated["TORCHINDUCTOR_CACHE_DIR"] = inductor_dir
+    updated["TRITON_CACHE_DIR"] = triton_dir
+    if os.environ.get("XDG_CACHE_HOME") == xdg_cache_home:
+        updated["XDG_CACHE_HOME"] = xdg_cache_home
+
+    return updated
+
+
+def abort_requested_backend_fallback(requested_backend: str, actual_backend: str, model_id: str) -> None:
+    if requested_backend == "vllm" and actual_backend != "vllm":
+        print(
+            "[ERROR] Requested backend 'vllm' but execution would fall back to "
+            f"'{actual_backend}' for model {model_id}. Refusing fallback and stopping. "
+            f"EXIT_CODE={EXIT_REQUESTED_VLLM_FALLBACK}",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_REQUESTED_VLLM_FALLBACK)
+
+
+# -----------------------------
+# Image handling
+# -----------------------------
+
+
+def resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h), Image.BICUBIC)
+
+
+def load_rgb_only(img_path: str, max_side: int = 768) -> Image.Image:
+    img = Image.open(img_path).convert("RGB")
+    return resize_max_side(img, max_side)
+
+
+def load_input_images(rgb_path: str, thermal_path: str, mode: str, max_side: int = 768) -> List[Image.Image]:
+    """
+    Returns a LIST of independent PIL Images to be passed separately to the model.
+    """
+    m = (mode or "rgb_thermal").lower().strip()
+    if m == "rgb":
+        return [load_rgb_only(rgb_path, max_side=max_side)]
+    if m == "thermal":
+        return [load_rgb_only(thermal_path, max_side=max_side)]
+    if m == "rgb_thermal":
+        rgb = load_rgb_only(rgb_path, max_side=max_side)
+        thr = load_rgb_only(thermal_path, max_side=max_side)
+        return [rgb, thr]
+    raise ValueError(f"Unknown input mode: {mode}. Use rgb, thermal, or rgb_thermal.")
+
+
+def concatenate_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
+    """Concatenate two RGB images side-by-side on a black canvas."""
+    left_rgb = left.convert("RGB")
+    right_rgb = right.convert("RGB")
+
+    w1, h1 = left_rgb.size
+    w2, h2 = right_rgb.size
+    out_w = w1 + w2
+    out_h = max(h1, h2)
+
+    canvas = Image.new("RGB", (out_w, out_h), color=(0, 0, 0))
+    y1 = (out_h - h1) // 2
+    y2 = (out_h - h2) // 2
+    canvas.paste(left_rgb, (0, y1))
+    canvas.paste(right_rgb, (w1, y2))
+    return canvas
+
+
+# -----------------------------
+# Prompt + parsing
+# -----------------------------
+
+
+def build_system_context(input_mode: str, temp_summary: dict) -> str:
+    """Build global context that should appear once before images."""
+    m = (input_mode or "rgb_thermal").lower().strip()
+
+    if m == "rgb":
+        image_desc = "You are provided with an RGB visual image of a scene.\n"
+    elif m == "thermal":
+        image_desc = "You are provided with a radiometric thermal image rendered with an inferno colormap.\n"
+    else:
+        image_desc = (
+            "You are provided with two separate images of the same scene:\n"
+            "1. The first image is a standard RGB visual aerial image.\n"
+            "2. The second image is a radiometric thermal image rendered with an inferno colormap.\n"
+            "Use BOTH images together to understand the scene.\n"
+        )
+
+    temp_text = ""
+    # Important ablation fix: do not leak thermal summary into RGB-only runs.
+    if temp_summary and m in {"thermal", "rgb_thermal"}:
+        temp_text = (
+            "Temperature Summary for the Thermal Image (in Celsius):\n"
+            f"- Minimum Temp: {temp_summary.get('min', 'N/A')}\n"
+            f"- Maximum Temp: {temp_summary.get('max', 'N/A')}\n"
+            f"- Mean Temp: {temp_summary.get('mean', 'N/A')}\n"
+            f"- Top 3% Mean: {temp_summary.get('top3_mean', 'N/A')}\n"
+            "Use these anchor points to map the observed thermal colors to approximate real temperatures.\n"
+        )
+
+    return f"{image_desc}\n{temp_text}".strip()
+
+
+def build_task_instruction(
+    question: str,
+    options: List[str],
+    input_mode: str,
+    temp_summary: dict,
+    is_second_prompt: bool = False,
+) -> str:
+    """Build task/question instruction block (this is what gets sandwiched)."""
+    opts = "\n".join([f"- {o}" for o in options])
+    parts = [
+        f"Question: {question}",
+        f"Options:\n{opts}",
+    ]
+
+    m = (input_mode or "rgb_thermal").lower().strip()
+    if is_second_prompt and (temp_summary is None) and (m in ["thermal", "rgb_thermal"]):
+        parts.append("No numeric temperature summary is provided in this run; rely on visible thermal patterns only.")
+
+    parts.append("Answer with exactly ONE option text (copy it verbatim).")
+    return "\n\n".join(parts)
+
+
+def build_fallback_text_prompt(
+    question: str,
+    options: List[str],
+    input_mode: str,
+    temp_summary: dict,
+    repeat_prompt: bool = False,
+) -> str:
+    """Fallback text prompt when model chat template is unavailable."""
+    system_context = build_system_context(input_mode, temp_summary)
+    task_before = build_task_instruction(question, options, input_mode, temp_summary, is_second_prompt=False)
+
+    if not repeat_prompt:
+        return f"{system_context}\n\n{task_before}" if system_context else task_before
+
+    task_after = build_task_instruction(question, options, input_mode, temp_summary, is_second_prompt=True)
+    if system_context:
+        return f"{system_context}\n\n{task_before}\n\n{task_after}"
+    return f"{task_before}\n\n{task_after}"
+
+
+def build_content_block(
+    images: List[Image.Image],
+    question: str,
+    options: List[str],
+    input_mode: str,
+    temp_summary: dict,
+    repeat_prompt: bool = False,
+) -> List[Dict[str, Any]]:
+    """Build split-sandwich structure: context once, task before/after images."""
+    system_context = build_system_context(input_mode, temp_summary)
+    task_before = build_task_instruction(question, options, input_mode, temp_summary, is_second_prompt=False)
+
+    content_block: List[Dict[str, Any]] = []
+    if system_context:
+        content_block.append({"type": "text", "text": system_context})
+    content_block.append({"type": "text", "text": task_before})
+    content_block.extend([{"type": "image"} for _ in images])
+    if repeat_prompt:
+        task_after = build_task_instruction(question, options, input_mode, temp_summary, is_second_prompt=True)
+        content_block.append({"type": "text", "text": task_after})
+    return content_block
+
+
+def prepend_text_block(content_block: List[Dict[str, Any]], text: Optional[str]) -> List[Dict[str, Any]]:
+    if not text:
+        return list(content_block)
+    return [{"type": "text", "text": text}] + list(content_block)
+
+
+def build_icl_intro_text(num_supports: int) -> str:
+    shot_word = "example" if num_supports == 1 else "examples"
+    return (
+        f"You will first see {num_supports} solved in-context {shot_word}. "
+        "Each solved example contains images, the question, the answer options, and the correct answer. "
+        "Use the solved examples as demonstrations of how to map the visual evidence to the correct option. "
+        "When you answer the final query, return exactly one option text copied verbatim from the provided options."
+    )
+
+
+def build_multiturn_message_spec(
+    images: List[Image.Image],
+    question: str,
+    options: List[str],
+    input_mode: str,
+    temp_summary: dict,
+    support_examples: Optional[List[Dict[str, Any]]] = None,
+    repeat_prompt: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Image.Image]]:
+    supports = support_examples or []
+    flat_images: List[Image.Image] = []
+
+    if not supports:
+        query_content = build_content_block(
+            images,
+            question,
+            options,
+            input_mode,
+            temp_summary,
+            repeat_prompt=repeat_prompt,
+        )
+        return [{"role": "user", "content": query_content}], list(images)
+
+    messages: List[Dict[str, Any]] = []
+    intro_text = build_icl_intro_text(len(supports))
+
+    for idx, support in enumerate(supports, start=1):
+        support_images = list(support.get("images", []))
+        support_content = build_content_block(
+            support_images,
+            support["question"],
+            support["options"],
+            input_mode,
+            support.get("temp_summary"),
+            repeat_prompt=repeat_prompt,
+        )
+        prefix = (intro_text + "\n\n") if idx == 1 else ""
+        prefix += (
+            f"Solved Example {idx}:\n"
+            "Study the images, question, and options. The assistant reply that follows is the correct answer "
+            "for this solved example."
+        )
+        messages.append({"role": "user", "content": prepend_text_block(support_content, prefix)})
+        messages.append({"role": "assistant", "content": str(support.get("gt_answer", ""))})
+        flat_images.extend(support_images)
+
+    query_prefix = (
+        f"Now answer a new query example using the {len(supports)} solved example(s) above as guidance. "
+        "Base your answer only on the new images and the provided options. "
+        "Return exactly one option text."
+    )
+    query_content = build_content_block(
+        images,
+        question,
+        options,
+        input_mode,
+        temp_summary,
+        repeat_prompt=repeat_prompt,
+    )
+    messages.append({"role": "user", "content": prepend_text_block(query_content, query_prefix)})
+    flat_images.extend(images)
+    return messages, flat_images
+
+
+def convert_message_spec_to_qwen_messages(
+    message_spec: List[Dict[str, Any]],
+    flat_images: List[Image.Image],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    tmp_files: List[str] = []
+    converted_messages: List[Dict[str, Any]] = []
+    image_idx = 0
+
+    for message in message_spec:
+        content = message.get("content")
+        if isinstance(content, list):
+            converted_content: List[Dict[str, Any]] = []
+            for block_item in content:
+                if block_item.get("type") == "text":
+                    converted_content.append(block_item)
+                elif block_item.get("type") == "image":
+                    if image_idx >= len(flat_images):
+                        raise RuntimeError("Qwen message/image alignment error: not enough images for message spec.")
+                    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                    tmp.close()
+                    flat_images[image_idx].save(tmp.name, format="PNG")
+                    tmp_files.append(tmp.name)
+                    converted_content.append({"type": "image", "image": tmp.name})
+                    image_idx += 1
+            converted_messages.append({"role": message["role"], "content": converted_content})
+        else:
+            converted_messages.append({"role": message["role"], "content": content})
+
+    if image_idx != len(flat_images):
+        raise RuntimeError(
+            f"Qwen message/image alignment error: consumed {image_idx} images for {len(flat_images)} provided images."
+        )
+    return converted_messages, tmp_files
+
+
+def convert_message_spec_to_vllm_messages(
+    message_spec: List[Dict[str, Any]],
+    flat_images: List[Image.Image],
+) -> List[Dict[str, Any]]:
+    converted_messages: List[Dict[str, Any]] = []
+    image_idx = 0
+
+    for message in message_spec:
+        content = message.get("content")
+        if isinstance(content, list):
+            converted_content: List[Dict[str, Any]] = []
+            for block_item in content:
+                if block_item.get("type") == "text":
+                    converted_content.append({"type": "text", "text": block_item.get("text", "")})
+                elif block_item.get("type") == "image":
+                    if image_idx >= len(flat_images):
+                        raise RuntimeError("vLLM message/image alignment error: not enough images for message spec.")
+                    converted_content.append({"type": "image_pil", "image_pil": flat_images[image_idx]})
+                    image_idx += 1
+            converted_messages.append({"role": message["role"], "content": converted_content})
+        else:
+            converted_messages.append({"role": message["role"], "content": content})
+
+    if image_idx != len(flat_images):
+        raise RuntimeError(
+            f"vLLM message/image alignment error: consumed {image_idx} images for {len(flat_images)} provided images."
+        )
+    return converted_messages
+
+
+def parse_choice_from_text(text: str, options: List[str]) -> Tuple[Optional[str], str]:
+    raw = text or ""
+    t = raw.strip()
+
+    for opt in options:
+        if norm(t) == norm(opt):
+            return opt, raw
+
+    opts_sorted = sorted(options, key=len, reverse=True)
+    tlow = norm(raw)
+    for opt in opts_sorted:
+        if norm(opt) in tlow:
+            return opt, raw
+
+    return None, raw
+
+
+# -----------------------------
+# Model runners
+# -----------------------------
+
+
+@dataclass
+class VLMConfig:
+    family: str
+    model_id: str
+
+
+def resolve_model(model_arg: str) -> VLMConfig:
+    m = (model_arg or "").lower().strip()
+    if m in ["llava", "llava-1.6-7b", "llava16", "llava16-7b", "llava-hf"]:
+        return VLMConfig(family="llava", model_id="llava-hf/llava-v1.6-mistral-7b-hf")
+    if m in ["qwen", "qwen3", "qwen3vl", "qwen3-vl", "qwen3-vl-8b", "qwen3-vl-8b-instruct"]:
+        return VLMConfig(family="qwen", model_id="Qwen/Qwen3-VL-8B-Instruct")
+    if m in ["llama3.2", "llama-3.2", "llama3.2-11b", "llama-3.2-11b-vision"]:
+        return VLMConfig(family="llama", model_id="meta-llama/Llama-3.2-11B-Vision-Instruct")
+    if m in ["internvl2", "internvl2-8b", "internvl"]:
+        return VLMConfig(family="internvl", model_id="OpenGVLab/InternVL2-8B")
+    if m in ["minicpm", "minicpm-v", "minicpm-v-2.6", "minicpmv2.6"]:
+        return VLMConfig(family="minicpm", model_id="openbmb/MiniCPM-V-2_6")
+    if m in ["pixtral", "pixtral-12b", "pixtral-12b-2409"]:
+        return VLMConfig(family="pixtral", model_id="mistralai/Pixtral-12B-2409")
+    raise ValueError(
+        f"Unknown --model '{model_arg}'. Supported: llava, qwen, llama3.2, internvl2, minicpm, pixtral"
+    )
+
+
+class LlavaRunner:
+    def __init__(self, model_id: str, device: str = "cuda", load_4bit: bool = False, revision: Optional[str] = None):
+        load_kwargs: Dict[str, Any] = {}
+        if revision:
+            load_kwargs["revision"] = revision
+
+        self.processor = AutoProcessor.from_pretrained(model_id, **load_kwargs)
+
+        if load_4bit:
+            from transformers import BitsAndBytesConfig
+
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                quantization_config=qconfig,
+                device_map="auto",
+                **load_kwargs,
+            )
+        else:
+            self.model = AutoModelForImageTextToText.from_pretrained(model_id, device_map="auto", **load_kwargs)
+
+        self.device = next(self.model.parameters()).device
+
+    @torch.inference_mode()
+    def run_one(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        max_new_tokens: int = 128,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        messages, flat_images = build_multiturn_message_spec(
+            images=images,
+            question=question,
+            options=options,
+            input_mode=input_mode,
+            temp_summary=temp_summary,
+            support_examples=support_examples,
+            repeat_prompt=repeat_prompt,
+        )
+        prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+
+        inputs = self.processor(images=flat_images, text=prompt, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items() if torch.is_tensor(v)}
+        pad_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
+        output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=pad_id)
+
+        input_len = inputs["input_ids"].shape[1]
+        trimmed_output_ids = output_ids[0][input_len:]
+
+        return self.processor.decode(trimmed_output_ids, skip_special_tokens=True)
+
+
+class QwenRunner:
+    def __init__(self, model_id: str, use_flash_attn2: bool = False, revision: Optional[str] = None):
+        kwargs = {"device_map": "auto"}
+        if revision:
+            kwargs["revision"] = revision
+        if use_flash_attn2:
+            kwargs.update({"dtype": torch.bfloat16, "attn_implementation": "flash_attention_2"})
+        else:
+            kwargs.update({"dtype": "auto"})
+
+        self.model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
+        processor_kwargs: Dict[str, Any] = {}
+        if revision:
+            processor_kwargs["revision"] = revision
+        self.processor = AutoProcessor.from_pretrained(model_id, **processor_kwargs)
+        self.device = next(self.model.parameters()).device
+
+    @torch.inference_mode()
+    def run_one(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        max_new_tokens: int = 128,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        message_spec, flat_images = build_multiturn_message_spec(
+            images=images,
+            question=question,
+            options=options,
+            input_mode=input_mode,
+            temp_summary=temp_summary,
+            support_examples=support_examples,
+            repeat_prompt=repeat_prompt,
+        )
+
+        tmp_files: List[str] = []
+        try:
+            messages, tmp_files = convert_message_spec_to_qwen_messages(message_spec, flat_images)
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.device)
+
+            generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
+            return output_text[0] if output_text else ""
+
+        finally:
+            for file_path in tmp_files:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+
+class GenericVLMRunner:
+    """Generic runner for VLM models using AutoModelForImageTextToText."""
+
+    def __init__(
+        self,
+        model_id: str,
+        device: str = "cuda",
+        load_4bit: bool = False,
+        use_flash_attn2: bool = False,
+        revision: Optional[str] = None,
+    ):
+        processor_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        model_kwargs: Dict[str, Any] = {"device_map": "auto", "trust_remote_code": True}
+        if revision:
+            processor_kwargs["revision"] = revision
+            model_kwargs["revision"] = revision
+
+        self.processor = AutoProcessor.from_pretrained(model_id, **processor_kwargs)
+
+        if use_flash_attn2:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        if load_4bit:
+            from transformers import BitsAndBytesConfig
+
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                quantization_config=qconfig,
+                **model_kwargs,
+            )
+        else:
+            self.model = AutoModelForImageTextToText.from_pretrained(model_id, **model_kwargs)
+
+        self.device = next(self.model.parameters()).device
+
+    @torch.inference_mode()
+    def run_one(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        max_new_tokens: int = 128,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        if support_examples:
+            raise ValueError("In-context learning is currently implemented only for LLaVA and Qwen runners.")
+        content_block = build_content_block(images, question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+        conversation = [{"role": "user", "content": content_block}]
+
+        try:
+            prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        except Exception:
+            prompt = build_fallback_text_prompt(question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+
+        inputs = self.processor(images=images, text=prompt, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items() if torch.is_tensor(v)}
+        pad_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
+        output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=pad_id)
+
+        input_ids = inputs.get("input_ids", None)
+        if input_ids is not None:
+            input_len = input_ids.shape[1]
+            trimmed_output_ids = output_ids[0][input_len:]
+        else:
+            trimmed_output_ids = output_ids[0]
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "decode"):
+            return tokenizer.decode(trimmed_output_ids, skip_special_tokens=True)
+        return self.processor.decode(trimmed_output_ids, skip_special_tokens=True)
+
+
+class VLMRunner:
+    def __init__(
+        self,
+        cfg: VLMConfig,
+        device: str,
+        load_4bit: bool,
+        use_flash_attn2: bool,
+        revision: Optional[str] = None,
+    ):
+        self.cfg = cfg
+        if cfg.family == "llava":
+            self.impl = LlavaRunner(cfg.model_id, device=device, load_4bit=load_4bit, revision=revision)
+        elif cfg.family == "qwen":
+            self.impl = QwenRunner(cfg.model_id, use_flash_attn2=use_flash_attn2, revision=revision)
+        elif cfg.family in ["llama", "internvl", "minicpm", "pixtral"]:
+            self.impl = GenericVLMRunner(
+                cfg.model_id,
+                device=device,
+                load_4bit=load_4bit,
+                use_flash_attn2=use_flash_attn2,
+                revision=revision,
+            )
+        else:
+            raise ValueError(f"Unsupported model family: {cfg.family}")
+
+    def run_one(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        max_new_tokens: int,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        return self.impl.run_one(
+            images,
+            question,
+            options,
+            input_mode,
+            temp_summary,
+            max_new_tokens=max_new_tokens,
+            repeat_prompt=repeat_prompt,
+            support_examples=support_examples,
+        )
+
+    def run_batch(self, batch_inputs: List[Dict[str, Any]], max_new_tokens: int, repeat_prompt: bool = False) -> List[str]:
+        if hasattr(self.impl, "run_batch"):
+            return self.impl.run_batch(batch_inputs, max_new_tokens=max_new_tokens, repeat_prompt=repeat_prompt)
+        out: List[str] = []
+        for bi in batch_inputs:
+            out.append(
+                self.run_one(
+                    images=bi["images"],
+                    question=bi["question"],
+                    options=bi["options"],
+                    input_mode=bi["input_mode"],
+                    temp_summary=bi.get("temp_summary"),
+                    max_new_tokens=max_new_tokens,
+                    repeat_prompt=repeat_prompt,
+                    support_examples=bi.get("support_examples"),
+                )
+            )
+        return out
+
+
+class VLLMRunner:
+    def __init__(
+        self,
+        cfg: VLMConfig,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: Optional[int] = None,
+        enable_prefix_caching: bool = True,
+        use_chat_api: bool = False,
+        allow_chat_fallback: bool = True,
+        revision: Optional[str] = None,
+        max_images_per_prompt: int = 4,
+    ):
+        if LLM is None or SamplingParams is None:
+            raise ImportError("vLLM is not installed. Install with: pip install vllm")
+
+        # Keep Pixtral on generate() path. The prior code both disabled and then
+        # re-forced chat mode, which was internally contradictory.
+        if cfg.family == "pixtral":
+            if bool(use_chat_api):
+                print(
+                    "[WARN] Pixtral vLLM chat API is disabled in this evaluator; "
+                    "using generate() so multi_modal_data keeps images attached."
+                )
+            use_chat_api = False
+            allow_chat_fallback = False
+
+        if cfg.family in VLLM_CHAT_FIRST_FAMILIES and not bool(use_chat_api):
+            use_chat_api = True
+            print(
+                f"[INFO] Forcing vLLM chat API for model family '{cfg.family}' "
+                "to avoid multimodal prompt replacement instability in generate()."
+            )
+
+        llm_kwargs: Dict[str, Any] = {
+            "model": cfg.model_id,
+            "tensor_parallel_size": max(1, int(tensor_parallel_size)),
+            "gpu_memory_utilization": float(gpu_memory_utilization),
+            "trust_remote_code": True,
+            "limit_mm_per_prompt": {"image": max(4, int(max_images_per_prompt))},
+            "enable_prefix_caching": bool(enable_prefix_caching),
+        }
+        if max_model_len is not None and int(max_model_len) > 0:
+            llm_kwargs["max_model_len"] = int(max_model_len)
+        if revision:
+            llm_kwargs["revision"] = revision
+        if cfg.family == "pixtral":
+            llm_kwargs["tokenizer_mode"] = "mistral"
+            print("[INFO] Pixtral will use vLLM generate API with Mistral tokenizer mode.")
+
+        try:
+            llm_sig = inspect.signature(LLM.__init__)
+            if (
+                "chat_template_content_format" in llm_sig.parameters
+                and cfg.family in VLLM_STRING_CHAT_TEMPLATE_FAMILIES
+            ):
+                llm_kwargs["chat_template_content_format"] = "string"
+                print("[INFO] Setting vLLM chat_template_content_format='string' for multimodal chat compatibility.")
+        except Exception:
+            pass
+
+        self.cfg = cfg
+        self.llm = LLM(**llm_kwargs)
+        processor_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+        if revision:
+            processor_kwargs["revision"] = revision
+        self.processor = AutoProcessor.from_pretrained(cfg.model_id, **processor_kwargs)
+        self.use_chat_api = bool(use_chat_api)
+        self.allow_chat_fallback = bool(allow_chat_fallback)
+        self.fallback_switched_to_chat = False
+
+    @staticmethod
+    def _build_vllm_chat_messages(
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        message_spec, flat_images = build_multiturn_message_spec(
+            images=images,
+            question=question,
+            options=options,
+            input_mode=input_mode,
+            temp_summary=temp_summary,
+            support_examples=support_examples,
+            repeat_prompt=repeat_prompt,
+        )
+        return convert_message_spec_to_vllm_messages(message_spec, flat_images)
+
+    def _inject_image_placeholders_into_text(self, prompt: str, num_images: int) -> str:
+        if num_images <= 0:
+            return prompt
+        p = prompt or ""
+
+        if self.cfg.family == "pixtral":
+            if "[IMG]" in p:
+                return p
+            prefix = "\n".join(["[IMG]"] * num_images)
+            return f"{prefix}\n{p}" if p else prefix
+
+        if self.cfg.family == "minicpm":
+            if "<image>./</image>" in p:
+                return p
+            prefix = "\n".join(["<image>./</image>"] * num_images)
+            return f"{prefix}\n{p}" if p else prefix
+
+        known_tokens = ["<image>", "<|image|>", "<img>", "[IMG]"]
+        if any(tok in p for tok in known_tokens):
+            return p
+        prefix = "\n".join(["<image>"] * num_images)
+        return f"{prefix}\n{p}" if p else prefix
+
+    @staticmethod
+    def _build_vllm_chat_content(content_block: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        vLLM/HF chat template processors may require image items to include an
+        'image' field to emit model-specific placeholder tokens.
+        """
+        out: List[Dict[str, Any]] = []
+        img_idx = 0
+        for block_item in content_block:
+            if block_item.get("type") == "image":
+                out.append({"type": "image", "image": f"placeholder_image_{img_idx}.png"})
+                img_idx += 1
+            else:
+                out.append(block_item)
+        return out
+
+    def _build_prompt_and_mm(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if support_examples:
+            raise ValueError("ICL with vLLM generate() is not supported; enable chat API for LLaVA/Qwen ICL runs.")
+        if self.cfg.family == "minicpm":
+            prompt = build_fallback_text_prompt(question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+        elif self.cfg.family == "pixtral":
+            prompt = build_fallback_text_prompt(question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+        else:
+            content_block = build_content_block(images, question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+            messages = [{"role": "user", "content": self._build_vllm_chat_content(content_block)}]
+            try:
+                prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            except Exception:
+                prompt = build_fallback_text_prompt(question, options, input_mode, temp_summary, repeat_prompt=repeat_prompt)
+        prompt = self._inject_image_placeholders_into_text(prompt, num_images=len(images))
+        return {
+            "prompt": prompt,
+            "multi_modal_data": {"image": images if len(images) > 1 else images[0]},
+        }
+
+    def run_one(
+        self,
+        images: List[Image.Image],
+        question: str,
+        options: List[str],
+        input_mode: str,
+        temp_summary: dict,
+        max_new_tokens: int = 128,
+        repeat_prompt: bool = False,
+        support_examples: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        sp = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
+        if self.use_chat_api:
+            messages = self._build_vllm_chat_messages(
+                images,
+                question,
+                options,
+                input_mode,
+                temp_summary,
+                repeat_prompt=repeat_prompt,
+                support_examples=support_examples,
+            )
+            outs = self.llm.chat(messages=messages, sampling_params=sp, use_tqdm=False)
+        else:
+            try:
+                req = self._build_prompt_and_mm(
+                    images,
+                    question,
+                    options,
+                    input_mode,
+                    temp_summary,
+                    repeat_prompt=repeat_prompt,
+                    support_examples=support_examples,
+                )
+                outs = self.llm.generate([req], sampling_params=sp, use_tqdm=False)
+            except Exception as e:
+                if "Failed to apply prompt replacement for mm_items" in str(e):
+                    if not self.allow_chat_fallback:
+                        raise
+                    self.use_chat_api = True
+                    self.fallback_switched_to_chat = True
+                    print("[WARN] vLLM prompt replacement failed; switching to slower chat API fallback for stability.")
+                    messages = self._build_vllm_chat_messages(
+                        images,
+                        question,
+                        options,
+                        input_mode,
+                        temp_summary,
+                        repeat_prompt=repeat_prompt,
+                        support_examples=support_examples,
+                    )
+                    outs = self.llm.chat(messages=messages, sampling_params=sp, use_tqdm=False)
+                else:
+                    raise
+        if not outs or not outs[0].outputs:
+            return ""
+        return outs[0].outputs[0].text
+
+    def run_batch(self, batch_inputs: List[Dict[str, Any]], max_new_tokens: int, repeat_prompt: bool = False) -> List[str]:
+        if not batch_inputs:
+            return []
+        sp = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
+
+        if self.use_chat_api:
+            conversations = [
+                self._build_vllm_chat_messages(
+                    images=bi["images"],
+                    question=bi["question"],
+                    options=bi["options"],
+                    input_mode=bi["input_mode"],
+                    temp_summary=bi.get("temp_summary"),
+                    repeat_prompt=repeat_prompt,
+                    support_examples=bi.get("support_examples"),
+                )
+                for bi in batch_inputs
+            ]
+            outs = self.llm.chat(messages=conversations, sampling_params=sp, use_tqdm=False)
+        else:
+            requests = [
+                self._build_prompt_and_mm(
+                    images=bi["images"],
+                    question=bi["question"],
+                    options=bi["options"],
+                    input_mode=bi["input_mode"],
+                    temp_summary=bi.get("temp_summary"),
+                    repeat_prompt=repeat_prompt,
+                    support_examples=bi.get("support_examples"),
+                )
+                for bi in batch_inputs
+            ]
+            try:
+                outs = self.llm.generate(requests, sampling_params=sp, use_tqdm=False)
+            except Exception as e:
+                if "Failed to apply prompt replacement for mm_items" in str(e):
+                    if not self.allow_chat_fallback:
+                        raise
+                    self.use_chat_api = True
+                    self.fallback_switched_to_chat = True
+                    print("[WARN] vLLM batch prompt replacement failed; switching to slower chat API fallback for stability.")
+                    conversations = [
+                        self._build_vllm_chat_messages(
+                            images=bi["images"],
+                            question=bi["question"],
+                            options=bi["options"],
+                            input_mode=bi["input_mode"],
+                            temp_summary=bi.get("temp_summary"),
+                            repeat_prompt=repeat_prompt,
+                            support_examples=bi.get("support_examples"),
+                        )
+                        for bi in batch_inputs
+                    ]
+                    outs = self.llm.chat(messages=conversations, sampling_params=sp, use_tqdm=False)
+                else:
+                    raise
+
+        out_texts: List[str] = []
+        for o in outs:
+            if o.outputs:
+                out_texts.append(o.outputs[0].text)
+            else:
+                out_texts.append("")
+        return out_texts
+
+    def runtime_mode(self) -> str:
+        if self.use_chat_api and self.fallback_switched_to_chat:
+            return "chat_fallback"
+        if self.use_chat_api:
+            return "chat_forced"
+        return "generate"
+
+
+# -----------------------------
+# Load rows
+# -----------------------------
+
+
+def flatten_checkpoint_json(obj: Dict[str, Any], source_name: str) -> List[Dict[str, Any]]:
+    items = obj.get("items", {})
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(items, dict):
+        return rows
+
+    for ck, entry in items.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("meta", {}), dict):
+            continue
+        row = dict(entry["meta"])
+        row["gt_answer"] = entry.get("human_answer", None)
+        row["checkpoint_key"] = ck
+        row["source_input"] = source_name
+        rows.append(row)
+
+    return rows
+
+
+def load_rows_for_eval(jf: str) -> List[Dict[str, Any]]:
+    obj = load_json_any(jf)
+    if isinstance(obj, dict) and obj.get("type") == "checkpoint" and isinstance(obj.get("items"), dict):
+        return flatten_checkpoint_json(obj, source_name=jf)
+
+    if isinstance(obj, list):
+        rows = [x for x in obj if isinstance(x, dict) and not is_header_line(x) and x.get("question_id")]
+        for r in rows:
+            r.setdefault("gt_answer", r.get("answer", None))
+            r["source_input"] = jf
+        return rows
+    return []
+
+
+def normalized_options_key(options: List[str]) -> Tuple[str, ...]:
+    return tuple(norm(o) for o in (options or []))
+
+
+def build_item_uid(item: Dict[str, Any]) -> str:
+    return "::".join(
+        [
+            str(item.get("source_input", "")),
+            str(item.get("checkpoint_key", "")),
+            str(item.get("image_id", "")),
+            str(item.get("question_id", "")),
+            norm(item.get("question")),
+        ]
+    )
+
+
+def build_icl_pool_key(item: Dict[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    question = item.get("question")
+    options = item.get("options", [])
+    if not question or not isinstance(options, list) or not options:
+        return None
+    return (norm(question), normalized_options_key(options))
+
+
+def has_required_fields_for_mode(item: Dict[str, Any], input_mode: str) -> bool:
+    rgb_path = item.get("rgb_path")
+    thermal_path = item.get("thermal_path")
+    question = item.get("question")
+    options = item.get("options", [])
+    gt_answer = item.get("gt_answer", None)
+
+    has_required_fields = bool(question and isinstance(options, list) and len(options) > 0 and gt_answer)
+    if input_mode in ["rgb", "rgb_thermal"]:
+        has_required_fields = has_required_fields and bool(rgb_path)
+    if input_mode in ["thermal", "rgb_thermal"]:
+        has_required_fields = has_required_fields and bool(thermal_path)
+    return has_required_fields
+
+
+def build_icl_pool_index(task_pairs: List[Tuple[str, Dict[str, Any]]]) -> Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]]:
+    pools: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
+    for _, item in task_pairs:
+        key = build_icl_pool_key(item)
+        if key is None:
+            continue
+        pools.setdefault(key, []).append(item)
+    for key in pools:
+        pools[key] = sorted(pools[key], key=build_item_uid)
+    return pools
+
+
+def select_icl_support_items(
+    target_item: Dict[str, Any],
+    icl_pool_index: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]],
+    icl_shots: int,
+    icl_seed: int,
+    input_mode: str,
+    cached_exists_fn,
+) -> List[Dict[str, Any]]:
+    if icl_shots <= 0:
+        return []
+
+    pool_key = build_icl_pool_key(target_item)
+    if pool_key is None:
+        return []
+
+    target_uid = build_item_uid(target_item)
+    target_image_id = str(target_item.get("image_id", ""))
+    filtered: List[Dict[str, Any]] = []
+    seen_image_ids = set()
+
+    for candidate in icl_pool_index.get(pool_key, []):
+        candidate_uid = build_item_uid(candidate)
+        if candidate_uid == target_uid:
+            continue
+        candidate_image_id = str(candidate.get("image_id", ""))
+        if target_image_id and candidate_image_id and candidate_image_id == target_image_id:
+            continue
+        if not has_required_fields_for_mode(candidate, input_mode):
+            continue
+        rgb_exists = cached_exists_fn(candidate.get("rgb_path")) if input_mode in ["rgb", "rgb_thermal"] else True
+        thr_exists = cached_exists_fn(candidate.get("thermal_path")) if input_mode in ["thermal", "rgb_thermal"] else True
+        if not rgb_exists or not thr_exists:
+            continue
+        image_dedupe_key = candidate_image_id or candidate_uid
+        if image_dedupe_key in seen_image_ids:
+            continue
+        seen_image_ids.add(image_dedupe_key)
+        filtered.append(candidate)
+
+    if not filtered:
+        return []
+
+    seed_material = f"{icl_seed}::{build_item_uid(target_item)}::{len(filtered)}::{icl_shots}"
+    seed_int = int(hashlib.sha1(seed_material.encode("utf-8")).hexdigest()[:16], 16)
+    rnd = random.Random(seed_int)
+    shuffled = list(filtered)
+    rnd.shuffle(shuffled)
+    return shuffled[: max(0, icl_shots)]
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, default="./response_v16")
+    ap.add_argument("--model", required=True, choices=["llava", "qwen", "llama3.2", "internvl2", "minicpm", "pixtral"])
+    ap.add_argument("--percent", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--outdir", default="./benchmark_results")
+    ap.add_argument("--input-mode", default="rgb_thermal", choices=["rgb", "thermal", "rgb_thermal"])
+    ap.add_argument("--max-side", type=int, default=768)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--backend", default="vllm", choices=["transformers", "vllm"])
+    ap.add_argument(
+        "--model-revision",
+        default=None,
+        help="Optional Hugging Face revision or commit SHA to pin model/processor loading.",
+    )
+    ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument("--load-4bit", action="store_true")
+    ap.add_argument("--use-flash-attn2", action="store_true")
+    ap.add_argument("--vllm-batch-size", type=int, default=8)
+    ap.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    ap.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    ap.add_argument("--vllm-max-model-len", type=int, default=0)
+    ap.add_argument(
+        "--vllm-use-chat-api",
+        action="store_true",
+        help="Use vLLM native chat API for multimodal requests. More robust but may be slower than generate().",
+    )
+    ap.add_argument(
+        "--disable-vllm-chat-fallback",
+        action="store_true",
+        help="Do not auto-switch to chat API on prompt replacement assertion. Keeps fast generate path only.",
+    )
+    ap.add_argument("--disable-vllm-prefix-caching", action="store_true")
+    ap.add_argument(
+        "--image-cache-size",
+        type=int,
+        default=512,
+        help="Number of resized images to keep in memory cache (0 disables cache).",
+    )
+    ap.add_argument("--debug-missing", type=int, default=5)
+    ap.add_argument("--debug-exceptions", type=int, default=3)
+    ap.add_argument(
+        "--repeat-prompt",
+        action="store_true",
+        help="Enable sandwich prompting: repeat question before and after images to mitigate 'lost in the middle' effect.",
+    )
+    ap.add_argument(
+        "--no-temp-summary",
+        action="store_true",
+        help="Run ablation without injecting the temperature summary.",
+    )
+    ap.add_argument(
+        "--icl-shots",
+        type=int,
+        default=0,
+        help="Number of multimodal in-context support examples to prepend for each query. Supported for llava/qwen only. Recommended values: 0, 1, or 2.",
+    )
+    ap.add_argument(
+        "--icl-seed",
+        type=int,
+        default=123,
+        help="Deterministic seed used to choose in-context support examples from the candidate pool.",
+    )
+    ap.add_argument(
+        "--icl-require-full-shots",
+        action="store_true",
+        help="If set, skip query examples that cannot assemble the full requested number of ICL support examples.",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Validate config/dataset and exit before loading model weights or running inference.")
+    args = ap.parse_args()
+
+    safe_mkdir(args.outdir)
+    args.device = pick_device(args.device)
+    cfg = resolve_model(args.model)
+
+    if args.icl_shots < 0:
+        raise ValueError("--icl-shots must be >= 0.")
+    if args.icl_shots > 0 and cfg.family not in ICL_SUPPORTED_FAMILIES:
+        raise ValueError(
+            f"--icl-shots is currently supported only for {sorted(ICL_SUPPORTED_FAMILIES)}; got model family '{cfg.family}'."
+        )
+
+    requested_backend = args.backend
+    if args.backend == "vllm" and cfg.family == "llama":
+        args.backend = "transformers"
+        abort_requested_backend_fallback(requested_backend, args.backend, cfg.model_id)
+    if args.backend == "transformers" and cfg.family == "pixtral":
+        print(
+            "[WARN] Pixtral transformers backend is not compatible with this "
+            "environment's AutoModelForImageTextToText path. Use --backend vllm "
+            "for Pixtral; overriding backend to vllm."
+        )
+        args.backend = "vllm"
+
+    json_files = find_json_files(args.input)
+
+    run_name = (
+        f"eval_{cfg.family}_{cfg.model_id.replace('/', '_')}"
+        f"_backend-{args.backend}"
+        f"_mode-{args.input_mode}"
+        f"_maxside-{args.max_side}"
+        f"_maxtok-{args.max_new_tokens}"
+        f"_repeatprompt-{int(bool(args.repeat_prompt))}"
+        f"_notempsummary-{int(bool(args.no_temp_summary))}"
+        f"_iclshots-{int(args.icl_shots)}"
+        f"_iclseed-{args.icl_seed}"
+        f"_iclrequirefull-{int(bool(args.icl_require_full_shots))}"
+        f"_p{int(round(args.percent * 100))}"
+        f"_seed{args.seed}"
+    )
+    preds_path = os.path.join(args.outdir, f"{run_name}_preds.jsonl")
+    metrics_json_path = preds_path.replace("_preds.jsonl", "_metrics.json")
+
+    run_config = {
+        "input": args.input,
+        "model_family": cfg.family,
+        "model_id": cfg.model_id,
+        "requested_backend": requested_backend,
+        "backend": args.backend,
+        "model_revision": args.model_revision,
+        "device": args.device,
+        "input_mode": args.input_mode,
+        "max_side": args.max_side,
+        "max_new_tokens": args.max_new_tokens,
+        "percent": args.percent,
+        "seed": args.seed,
+        "repeat_prompt": bool(args.repeat_prompt),
+        "no_temp_summary": bool(args.no_temp_summary),
+        "icl_shots": int(args.icl_shots),
+        "icl_seed": int(args.icl_seed),
+        "icl_require_full_shots": bool(args.icl_require_full_shots),
+        "icl_selection_policy": "exact_question_plus_options_distinct_image",
+        "load_4bit": bool(args.load_4bit),
+        "use_flash_attn2": bool(args.use_flash_attn2),
+        "vllm_batch_size": args.vllm_batch_size,
+        "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+        "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+        "vllm_max_model_len": args.vllm_max_model_len,
+        "vllm_use_chat_api_requested": bool(args.vllm_use_chat_api),
+        "vllm_chat_fallback_enabled": (not bool(args.disable_vllm_chat_fallback)),
+        "vllm_prefix_caching_enabled": (not args.disable_vllm_prefix_caching),
+        "image_cache_size": int(args.image_cache_size),
+        "llama_rgb_thermal_concat": bool(cfg.family == "llama" and args.input_mode == "rgb_thermal"),
+        "dry_run": bool(args.dry_run),
+        "run_name": run_name,
+        "predictions_path": preds_path,
+        "metrics_path": metrics_json_path,
+    }
+
+    overall_total, overall_correct = 0, 0
+    by_cat, by_qid, by_image = {}, {}, {}
+
+    if os.path.exists(preds_path):
+        os.remove(preds_path)
+
+    print(f"Scanning {len(json_files)} JSON files...")
+    global_tasks: List[Tuple[str, Dict[str, Any]]] = []
+    for jf in tqdm(
+        json_files,
+        desc="Loading JSON files",
+        unit="file",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{percentage:.0f}%] - {elapsed}<{remaining}",
+    ):
+        rows = load_rows_for_eval(jf)
+        sampled_rows, _ = sample_images_and_expand(rows, args.percent, seed=args.seed)
+        for item in sampled_rows:
+            global_tasks.append((jf, item))
+
+    total_questions = len(global_tasks)
+    icl_pool_index = build_icl_pool_index(global_tasks) if args.icl_shots > 0 else {}
+    print(f"Total sampled questions queued for evaluation: {total_questions}")
+
+    if args.dry_run:
+        missing_field_count = 0
+        missing_file_count = 0
+        eligible_count = 0
+        dryrun_missing_examples: List[Tuple[str, str]] = []
+
+        for _, item in global_tasks:
+            rgb_path = item.get("rgb_path")
+            thermal_path = item.get("thermal_path")
+
+            if not has_required_fields_for_mode(item, args.input_mode):
+                missing_field_count += 1
+                continue
+
+            rgb_exists = os.path.exists(rgb_path) if args.input_mode in ["rgb", "rgb_thermal"] else True
+            thr_exists = os.path.exists(thermal_path) if args.input_mode in ["thermal", "rgb_thermal"] else True
+            if not rgb_exists or not thr_exists:
+                missing_file_count += 1
+                if len(dryrun_missing_examples) < max(0, args.debug_missing):
+                    dryrun_missing_examples.append((rgb_path, thermal_path))
+                continue
+
+            eligible_count += 1
+
+        dryrun_report_path = os.path.join(args.outdir, f"{run_name}_dryrun.json")
+        dryrun_icl_support_full = 0
+        dryrun_icl_support_zero = 0
+        if args.icl_shots > 0:
+            def _dryrun_cached_exists(path: Optional[str]) -> bool:
+                if not path:
+                    return False
+                return os.path.exists(path)
+            for _, item in global_tasks:
+                if not has_required_fields_for_mode(item, args.input_mode):
+                    continue
+                rgb_exists = _dryrun_cached_exists(item.get("rgb_path")) if args.input_mode in ["rgb", "rgb_thermal"] else True
+                thr_exists = _dryrun_cached_exists(item.get("thermal_path")) if args.input_mode in ["thermal", "rgb_thermal"] else True
+                if not rgb_exists or not thr_exists:
+                    continue
+                supports = select_icl_support_items(
+                    target_item=item,
+                    icl_pool_index=icl_pool_index,
+                    icl_shots=args.icl_shots,
+                    icl_seed=args.icl_seed,
+                    input_mode=args.input_mode,
+                    cached_exists_fn=_dryrun_cached_exists,
+                )
+                if len(supports) == 0:
+                    dryrun_icl_support_zero += 1
+                if len(supports) >= args.icl_shots:
+                    dryrun_icl_support_full += 1
+
+        dryrun_report = {
+            "status": "dry_run_only",
+            "run_config": run_config,
+            "summary": {
+                "json_files_discovered": len(json_files),
+                "total_sampled_questions": total_questions,
+                "eligible_for_eval": eligible_count,
+                "skipped_missing_fields": missing_field_count,
+                "skipped_missing_files": missing_file_count,
+                "icl_queries_with_full_requested_shots": dryrun_icl_support_full,
+                "icl_queries_with_zero_support_examples": dryrun_icl_support_zero,
+            },
+            "sample_missing_paths": [
+                {"rgb_path": r, "thermal_path": t} for r, t in dryrun_missing_examples
+            ],
+        }
+        with open(dryrun_report_path, "w") as f:
+            json.dump(dryrun_report, f, indent=2)
+
+        print("\n[DRY-RUN] Validation complete. No model loaded; no inference executed.")
+        print(f"[DRY-RUN] JSON files discovered: {len(json_files)}")
+        print(f"[DRY-RUN] Sampled questions: {total_questions}")
+        print(f"[DRY-RUN] Eligible for evaluation: {eligible_count}")
+        print(f"[DRY-RUN] Skipped (missing fields): {missing_field_count}")
+        print(f"[DRY-RUN] Skipped (missing files): {missing_file_count}")
+        if args.icl_shots > 0:
+            print(f"[DRY-RUN] Queries with full requested ICL shots: {dryrun_icl_support_full}")
+            print(f"[DRY-RUN] Queries with zero ICL supports: {dryrun_icl_support_zero}")
+        print(f"[DRY-RUN] Report JSON: {dryrun_report_path}")
+        return
+
+    if total_questions == 0:
+        metrics = {
+            "model_family": cfg.family,
+            "model_id": cfg.model_id,
+            "input_mode": args.input_mode,
+            "run_config": run_config,
+            "overall": {"total": 0, "correct": 0, "accuracy": 0.0},
+            "by_category": {},
+            "more_info": {
+                "json_files_discovered": len(json_files),
+                "total_sampled_questions": 0,
+                "queued": 0,
+                "evaluated": 0,
+                "skipped_missing_fields": 0,
+                "skipped_missing_files": 0,
+                "exceptions": 0,
+                "icl_skipped_insufficient_support": 0,
+            },
+        }
+        with open(metrics_json_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print("No questions found after loading/sampling. Exiting.")
+        print(f"Metrics JSON: {metrics_json_path}")
+        return
+
+    if args.backend == "vllm":
+        if args.device != "cuda":
+            raise ValueError("--backend vllm currently requires CUDA. Use --device cuda.")
+        if args.load_4bit:
+            print("[WARN] --load-4bit is ignored when --backend vllm is selected.")
+        if args.use_flash_attn2:
+            print("[WARN] --use-flash-attn2 is ignored when --backend vllm is selected.")
+        env_updates = prepare_writable_runtime_env(args.outdir, run_name)
+        if env_updates:
+            pretty = " | ".join([f"{k}={v}" for k, v in sorted(env_updates.items())])
+            print(f"[INFO] Runtime cache/tmp overrides applied for vLLM: {pretty}")
+        suppress_vllm_known_noisy_warnings()
+
+        effective_use_chat_api = bool(args.vllm_use_chat_api) or (cfg.family in VLLM_CHAT_FIRST_FAMILIES)
+        if args.icl_shots > 0 and cfg.family in ICL_SUPPORTED_FAMILIES:
+            if not effective_use_chat_api:
+                print(
+                    f"[INFO] Auto-enabling --vllm-use-chat-api for model family '{cfg.family}' because multimodal ICL uses multi-turn chat messages."
+                )
+            effective_use_chat_api = True
+        if effective_use_chat_api and (not bool(args.vllm_use_chat_api)) and (cfg.family in VLLM_CHAT_FIRST_FAMILIES):
+            print(
+                f"[INFO] Auto-enabling --vllm-use-chat-api for model family '{cfg.family}' "
+                "for stability."
+            )
+
+        runner = VLLMRunner(
+            cfg,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_model_len=(args.vllm_max_model_len if args.vllm_max_model_len > 0 else None),
+            enable_prefix_caching=not args.disable_vllm_prefix_caching,
+            use_chat_api=effective_use_chat_api,
+            allow_chat_fallback=(not bool(args.disable_vllm_chat_fallback)),
+            revision=args.model_revision,
+            max_images_per_prompt=max(4, (max(0, int(args.icl_shots)) + 1) * (2 if args.input_mode == "rgb_thermal" else 1)),
+        )
+        run_config["effective_vllm_use_chat_api"] = bool(runner.use_chat_api)
+        run_config["effective_vllm_runtime_mode"] = runner.runtime_mode()
+    else:
+        runner = VLMRunner(
+            cfg,
+            device=args.device,
+            load_4bit=args.load_4bit,
+            use_flash_attn2=args.use_flash_attn2,
+            revision=args.model_revision,
+        )
+        run_config["effective_vllm_use_chat_api"] = False
+        run_config["effective_vllm_runtime_mode"] = "n/a"
+
+    skip_missing_fields, skip_missing_files, exceptions, printed_ex = 0, 0, 0, 0
+    missing_examples: List[Tuple[str, str]] = []
+    image_cache: Dict[str, Image.Image] = {}
+    image_cache_size = max(0, int(args.image_cache_size))
+    path_exists_cache: Dict[str, bool] = {}
+
+    def _cached_exists(path: Optional[str]) -> bool:
+        if not path:
+            return False
+        if path not in path_exists_cache:
+            path_exists_cache[path] = os.path.exists(path)
+        return path_exists_cache[path]
+
+    def _get_cached_rgb(path: str) -> Image.Image:
+        key = f"{path}|{args.max_side}"
+        if image_cache_size > 0 and key in image_cache:
+            return image_cache[key].copy()
+
+        img = load_rgb_only(path, max_side=args.max_side)
+        if image_cache_size > 0:
+            if len(image_cache) >= image_cache_size:
+                try:
+                    oldest_key = next(iter(image_cache))
+                    image_cache.pop(oldest_key, None)
+                except Exception:
+                    image_cache.clear()
+            image_cache[key] = img
+        return img.copy()
+
+    def _load_images_for_item(item_ref: Dict[str, Any]) -> List[Image.Image]:
+        rgb_path = item_ref.get("rgb_path")
+        thermal_path = item_ref.get("thermal_path")
+        if args.input_mode == "rgb":
+            images_local = [_get_cached_rgb(rgb_path)]
+        elif args.input_mode == "thermal":
+            images_local = [_get_cached_rgb(thermal_path)]
+        else:
+            images_local = [_get_cached_rgb(rgb_path), _get_cached_rgb(thermal_path)]
+        if cfg.family == "llama" and args.input_mode == "rgb_thermal" and len(images_local) == 2:
+            images_local = [concatenate_side_by_side(images_local[0], images_local[1])]
+        return images_local
+
+    icl_support_queries_total = 0
+    icl_support_queries_full = 0
+    icl_support_queries_zero = 0
+    icl_support_examples_used_total = 0
+    skip_icl_insufficient_support = 0
+
+    with open(preds_path, "a") as f_out:
+        pbar = tqdm(
+            total=total_questions,
+            desc="Benchmarking VLM",
+            unit="question",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{percentage:.0f}%] - {elapsed}<{remaining}",
+        )
+
+        pending_batch: List[Dict[str, Any]] = []
+        processed_count = 0
+
+        def write_result(
+            item_ref: Dict[str, Any],
+            jf_ref: str,
+            raw_text: Optional[str],
+            error: Optional[Exception] = None,
+            support_examples: Optional[List[Dict[str, Any]]] = None,
+        ):
+            nonlocal overall_correct, exceptions, printed_ex
+            image_id = str(item_ref.get("image_id", "UNKNOWN"))
+            qid = str(item_ref.get("question_id", "UNKNOWN"))
+            cat = str(item_ref.get("category", "UNKNOWN"))
+            options = item_ref.get("options", [])
+            gt_answer = item_ref.get("gt_answer", None)
+
+            def _update_group_stats(is_correct_bool: bool) -> None:
+                for d, key in [(by_cat, cat), (by_qid, qid), (by_image, image_id)]:
+                    d.setdefault(key, {"total": 0, "correct": 0})
+                    d[key]["total"] += 1
+                    d[key]["correct"] += int(is_correct_bool)
+
+            icl_support_meta = [
+                {
+                    "source_input": s.get("source_input"),
+                    "checkpoint_key": s.get("checkpoint_key"),
+                    "image_id": s.get("image_id"),
+                    "question_id": s.get("question_id"),
+                    "gt_answer": s.get("gt_answer"),
+                }
+                for s in (support_examples or [])
+            ]
+
+            if error is not None:
+                exceptions += 1
+                _update_group_stats(False)
+                if printed_ex < args.debug_exceptions:
+                    printed_ex += 1
+                    print(
+                        f"\n[EXCEPTION] Example failure:\n  image_id={image_id} question_id={qid}\n  error={repr(error)}"
+                    )
+                rec = {
+                    "model_family": cfg.family,
+                    "model_id": cfg.model_id,
+                    "input_mode": args.input_mode,
+                    "image_id": image_id,
+                    "question_id": qid,
+                    "category": cat,
+                    "pred_answer": None,
+                    "correct": False,
+                    "raw_model_output": None,
+                    "error": repr(error),
+                    "icl_requested_shots": int(args.icl_shots),
+                    "icl_used_shots": len(icl_support_meta),
+                    "icl_support_examples": icl_support_meta,
+                }
+                f_out.write(json.dumps(rec) + "\n")
+                return
+
+            pred_answer, raw = parse_choice_from_text(raw_text or "", options)
+            is_correct = (pred_answer is not None) and (norm(pred_answer) == norm(gt_answer))
+            overall_correct += int(is_correct)
+            _update_group_stats(bool(is_correct))
+
+            rec = {
+                "model_family": cfg.family,
+                "model_id": cfg.model_id,
+                "input_mode": args.input_mode,
+                "source_input": item_ref.get("source_input", jf_ref),
+                "checkpoint_key": item_ref.get("checkpoint_key", None),
+                "image_id": image_id,
+                "question_id": qid,
+                "category": cat,
+                "rgb_path": item_ref.get("rgb_path"),
+                "thermal_path": item_ref.get("thermal_path"),
+                "question": item_ref.get("question"),
+                "options": options,
+                "gt_answer": gt_answer,
+                "pred_answer": pred_answer,
+                "correct": bool(is_correct),
+                "raw_model_output": raw,
+                "error": None,
+                "icl_requested_shots": int(args.icl_shots),
+                "icl_used_shots": len(icl_support_meta),
+                "icl_support_examples": icl_support_meta,
+            }
+            f_out.write(json.dumps(rec) + "\n")
+
+        def flush_batch_if_needed(force: bool = False):
+            nonlocal pending_batch, processed_count
+            batch_size = max(1, int(args.vllm_batch_size)) if args.backend == "vllm" else 1
+            if (not force) and len(pending_batch) < batch_size:
+                return
+            if not pending_batch:
+                return
+
+            run_batch = pending_batch if force else pending_batch[:batch_size]
+            pending_batch = [] if force else pending_batch[batch_size:]
+
+            try:
+                raw_outputs = runner.run_batch(
+                    [
+                        {
+                            "images": x["images"],
+                            "question": x["item"]["question"],
+                            "options": x["item"]["options"],
+                            "input_mode": args.input_mode,
+                            "temp_summary": x["temp_summary"],
+                            "support_examples": x.get("icl_support_examples", []),
+                        }
+                        for x in run_batch
+                    ],
+                    max_new_tokens=args.max_new_tokens,
+                    repeat_prompt=args.repeat_prompt,
+                )
+                if len(raw_outputs) != len(run_batch):
+                    raise RuntimeError(f"Mismatched batch outputs: got {len(raw_outputs)} for {len(run_batch)} inputs")
+
+                for x, raw in zip(run_batch, raw_outputs):
+                    write_result(x["item"], x["jf"], raw_text=raw, error=None, support_examples=x.get("icl_support_examples", []))
+                    processed_count += 1
+                    pbar.update(1)
+            except Exception as batch_err:
+                for x in run_batch:
+                    try:
+                        raw = runner.run_one(
+                            images=x["images"],
+                            question=x["item"]["question"],
+                            options=x["item"]["options"],
+                            input_mode=args.input_mode,
+                            temp_summary=x["temp_summary"],
+                            max_new_tokens=args.max_new_tokens,
+                            repeat_prompt=args.repeat_prompt,
+                            support_examples=x.get("icl_support_examples", []),
+                        )
+                        write_result(x["item"], x["jf"], raw_text=raw, error=None, support_examples=x.get("icl_support_examples", []))
+                    except Exception as single_err:
+                        write_result(
+                            x["item"],
+                            x["jf"],
+                            raw_text=None,
+                            error=(single_err if single_err is not None else batch_err),
+                            support_examples=x.get("icl_support_examples", []),
+                        )
+                    processed_count += 1
+                    pbar.update(1)
+            finally:
+                pbar.set_postfix(
+                    done=overall_total,
+                    left=(total_questions - processed_count),
+                    skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+                    exceptions=exceptions,
+                    refresh=False,
+                )
+
+        for jf, item in global_tasks:
+            rgb_path = item.get("rgb_path")
+            thermal_path = item.get("thermal_path")
+            question = item.get("question")
+            options = item.get("options", [])
+            gt_answer = item.get("gt_answer", None)
+            temp_summary = None if args.no_temp_summary else item.get("temp_summary", None)
+
+            if not has_required_fields_for_mode(item, args.input_mode):
+                skip_missing_fields += 1
+                processed_count += 1
+                pbar.update(1)
+                pbar.set_postfix(
+                    done=overall_total,
+                    left=(total_questions - processed_count),
+                    skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+                    exceptions=exceptions,
+                    refresh=False,
+                )
+                continue
+
+            rgb_exists = _cached_exists(rgb_path) if args.input_mode in ["rgb", "rgb_thermal"] else True
+            thr_exists = _cached_exists(thermal_path) if args.input_mode in ["thermal", "rgb_thermal"] else True
+
+            if not rgb_exists or not thr_exists:
+                skip_missing_files += 1
+                if len(missing_examples) < max(0, args.debug_missing):
+                    missing_examples.append((rgb_path, thermal_path))
+                processed_count += 1
+                pbar.update(1)
+                pbar.set_postfix(
+                    done=overall_total,
+                    left=(total_questions - processed_count),
+                    skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+                    exceptions=exceptions,
+                    refresh=False,
+                )
+                continue
+
+            icl_support_examples: List[Dict[str, Any]] = []
+            support_items: List[Dict[str, Any]] = []
+            if args.icl_shots > 0:
+                support_items = select_icl_support_items(
+                    target_item=item,
+                    icl_pool_index=icl_pool_index,
+                    icl_shots=args.icl_shots,
+                    icl_seed=args.icl_seed,
+                    input_mode=args.input_mode,
+                    cached_exists_fn=_cached_exists,
+                )
+                if args.icl_require_full_shots and len(support_items) < args.icl_shots:
+                    skip_icl_insufficient_support += 1
+                    processed_count += 1
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        done=overall_total,
+                        left=(total_questions - processed_count),
+                        skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+                        exceptions=exceptions,
+                        refresh=False,
+                    )
+                    continue
+
+            overall_total += 1
+
+            try:
+                images = _load_images_for_item(item)
+                for support_item in support_items:
+                    support_temp_summary = None if args.no_temp_summary else support_item.get("temp_summary", None)
+                    support_images = _load_images_for_item(support_item)
+                    icl_support_examples.append(
+                        {
+                            "source_input": support_item.get("source_input"),
+                            "checkpoint_key": support_item.get("checkpoint_key"),
+                            "image_id": support_item.get("image_id"),
+                            "question_id": support_item.get("question_id"),
+                            "question": support_item.get("question"),
+                            "options": support_item.get("options", []),
+                            "gt_answer": support_item.get("gt_answer"),
+                            "temp_summary": support_temp_summary,
+                            "images": support_images,
+                        }
+                    )
+            except Exception as e:
+                write_result(item, jf, raw_text=None, error=e, support_examples=icl_support_examples)
+                processed_count += 1
+                pbar.update(1)
+                pbar.set_postfix(
+                    done=overall_total,
+                    left=(total_questions - processed_count),
+                    skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+                    exceptions=exceptions,
+                    refresh=False,
+                )
+                continue
+
+            if args.icl_shots > 0:
+                icl_support_queries_total += 1
+                icl_support_examples_used_total += len(icl_support_examples)
+                if len(icl_support_examples) == 0:
+                    icl_support_queries_zero += 1
+                if len(icl_support_examples) >= args.icl_shots:
+                    icl_support_queries_full += 1
+
+            pending_batch.append(
+                {
+                    "jf": jf,
+                    "item": item,
+                    "images": images,
+                    "temp_summary": temp_summary,
+                    "icl_support_examples": icl_support_examples,
+                }
+            )
+            flush_batch_if_needed(force=False)
+
+        flush_batch_if_needed(force=True)
+        while processed_count < total_questions:
+            processed_count += 1
+            pbar.update(1)
+        pbar.set_postfix(
+            done=overall_total,
+            left=(total_questions - processed_count),
+            skipped=(skip_missing_fields + skip_missing_files + skip_icl_insufficient_support),
+            exceptions=exceptions,
+            refresh=False,
+        )
+        pbar.close()
+
+    metrics = {
+        "model_family": cfg.family,
+        "model_id": cfg.model_id,
+        "input_mode": args.input_mode,
+        "run_config": run_config,
+        "overall": {"total": overall_total, "correct": overall_correct, "accuracy": acc(overall_correct, overall_total)},
+        "by_category": {k: {**v, "accuracy": acc(v["correct"], v["total"])} for k, v in sorted(by_cat.items())},
+        "more_info": {
+            "json_files_discovered": len(json_files),
+            "total_sampled_questions": total_questions,
+            "queued": total_questions,
+            "evaluated": overall_total,
+            "skipped_missing_fields": skip_missing_fields,
+            "skipped_missing_files": skip_missing_files,
+            "icl_skipped_insufficient_support": skip_icl_insufficient_support,
+            "exceptions": exceptions,
+            "debug_missing_examples_count": len(missing_examples),
+            "icl_queries_considered": icl_support_queries_total,
+            "icl_queries_with_full_requested_shots": icl_support_queries_full,
+            "icl_queries_with_zero_support_examples": icl_support_queries_zero,
+            "icl_support_examples_used_total": icl_support_examples_used_total,
+            "icl_support_examples_used_avg": (icl_support_examples_used_total / icl_support_queries_total) if icl_support_queries_total > 0 else 0.0,
+            "vllm_runtime_mode": (
+                runner.runtime_mode() if args.backend == "vllm" and isinstance(runner, VLLMRunner) else "n/a"
+            ),
+            "image_cache_entries": len(image_cache),
+        },
+    }
+
+    with open(metrics_json_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(
+        f"Queued: {total_questions} | Evaluated: {overall_total} | "
+        f"Skipped: {skip_missing_fields + skip_missing_files + skip_icl_insufficient_support} | Exceptions: {exceptions}"
+    )
+    if missing_examples:
+        print("Sample missing file paths:")
+        for rgb_ex, thr_ex in missing_examples:
+            print(f"  rgb={rgb_ex} | thermal={thr_ex}")
+
+    print(f"\nMetrics JSON: {metrics_json_path}")
+    print(f"Overall Accuracy: {acc(overall_correct, overall_total):.4f}")
+
+
+if __name__ == "__main__":
+    main()
