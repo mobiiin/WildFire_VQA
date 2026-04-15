@@ -1,295 +1,265 @@
-# FlameVQA
+# FlameVQA Evaluation Toolkit
 
-FlameVQA is a benchmarking workspace for evaluating vision-language models on wildfire-focused visual question answering tasks using RGB imagery, thermal imagery, or both together.
+This repository contains a unified evaluation pipeline for multimodal VLM benchmarking on FlameVQA-style datasets.
 
-The repository is built around a unified evaluation pipeline that:
-- loads checkpoint-style or list-style JSON datasets,
-- runs multimodal inference with several VLM families,
-- supports both `transformers` and `vllm` backends,
-- evaluates ablations such as `rgb`, `thermal`, `rgb_thermal`, repeated prompting, and temperature-summary removal,
-- writes per-question predictions and aggregate metrics to JSON/JSONL files.
+- Main evaluator: `eval_vlm_checkpoint.py`
+- Batch ablation runner: `run_all_evals.sh`
 
-## Supported models
+## Open Dataset Releases
 
-Current model shortcuts:
+- Kaggle: https://www.kaggle.com/datasets/caseypiere/wildfire-vqa
+- Hugging Face: https://huggingface.co/datasets/mobiiin/WildFire_VQA
 
-| Argument | Model ID | Family |
-|---|---|---|
-| `llava` | `llava-hf/llava-v1.6-mistral-7b-hf` | LLaVA |
-| `qwen` | `Qwen/Qwen3-VL-8B-Instruct` | Qwen3-VL |
-| `llama3.2` | `meta-llama/Llama-3.2-11B-Vision-Instruct` | Llama Vision |
-| `internvl2` | `OpenGVLab/InternVL2-8B` | InternVL2 |
-| `minicpm` | `openbmb/MiniCPM-V-2_6` | MiniCPM-V |
-| `pixtral` | `mistralai/Pixtral-12B-2409` | Pixtral |
+This project is open-source and the WildFire VQA dataset is publicly available on both platforms above.
 
-See [MODEL_OPTIONS.md](MODEL_OPTIONS.md) for quick examples.
+The pipeline supports:
+- Multiple open-source VLMs
+- Multiple input modes (`rgb`, `thermal`, `rgb_thermal`)
+- Prompt sandwich ablation (`--repeat-prompt`)
+- Temperature-summary ablation (`--no-temp-summary`)
+- Dataset validation mode (`--dry-run`)
 
-## Repository layout
+---
 
-Main files in this repo:
+## 1) Supported Models
 
-- [eval_vlm_checkpoint.py](eval_vlm_checkpoint.py) — main unified evaluator
-- [eval_vlm_checkpoint_minicpm.py](eval_vlm_checkpoint_minicpm.py) — MiniCPM-focused evaluator and vLLM experiments
-- [llama_eval_vlm_checkpoint.py](llama_eval_vlm_checkpoint.py) — alternate evaluator variant
-- [run_all_evals.sh](run_all_evals.sh) — local sweep runner for models / modes / ablations
-- [submit_evals.sh](submit_evals.sh) — generates a Slurm array submission map
-- [eval_array.slurm](eval_array.slurm) — Slurm array job definition
-- [update_response16_image_paths.py](update_response16_image_paths.py) — updates image path prefixes in dataset JSON files and validates accessibility
-- [check_image_paths.py](check_image_paths.py) — path checking utility
-- [response_v16](response_v16) — evaluation dataset JSON files
-- [benchmark_results](benchmark_results) — generated predictions and metrics
+`eval_vlm_checkpoint.py --model` supports:
+- `llava` → `llava-hf/llava-v1.6-mistral-7b-hf`
+- `qwen` → `Qwen/Qwen3-VL-8B-Instruct`
+- `llama3.2` → `meta-llama/Llama-3.2-11B-Vision-Instruct`
+- `internvl2` → `OpenGVLab/InternVL2-8B`
+- `minicpm` → `openbmb/MiniCPM-V-2_6`
+- `pixtral` → `mistralai/Pixtral-12B-2409`
 
-## Dataset format
+---
 
-The evaluator supports two input styles:
+## 2) Installation
 
-1. **Checkpoint-style JSON**
-   - top-level `type: "checkpoint"`
-   - per-item metadata stored under `items`
-   - human answer is mapped to `gt_answer`
-
-2. **List-style JSON**
-   - list of rows with question entries
-
-Typical row fields include:
-- `image_id`
-- `rgb_path`
-- `thermal_path`
-- `temp_summary`
-- `category`
-- `question_id`
-- `question`
-- `options`
-- `answer`
-
-Example:
-
-```json
-{
-  "image_id": "00001",
-  "rgb_path": "/path/to/rgb.jpg",
-  "thermal_path": "/path/to/thermal.jpg",
-  "temp_summary": {
-    "min": 16.9,
-    "max": 25.2,
-    "mean": 20.8,
-    "top3_mean": 22.7
-  },
-  "category": "Presence and Detection",
-  "question_id": "PD1",
-  "question": "Are active thermal hotspots detected?",
-  "options": ["Yes", "No"],
-  "answer": "No"
-}
-```
-
-## Environment setup
-
-This repo includes a Conda environment file:
-- [flamevqa.yml](flamevqa.yml)
-
-Create and activate it:
+## 2.1 Create environment
 
 ```bash
-conda env create -f flamevqa.yml
+conda create -n flamevqa python=3.11 -y
 conda activate flamevqa
 ```
 
-If you use gated Hugging Face models, configure a token in your shell or `.env` file. The batch script reads values such as:
-- `HUGGINGFACE_TOKEN`
-- `HF_API_TOKEN`
-- `HF_HUB_TOKEN`
-- `HUGGINGFACE_HUB_TOKEN`
-- `HF_TOKEN`
+## 2.2 Install dependencies
 
-## Basic usage
-
-### Run a single evaluation
+Install PyTorch for your CUDA version first (recommended from pytorch.org), then:
 
 ```bash
-python eval_vlm_checkpoint.py \
-  --input ./response_v16 \
-  --model llava \
-  --input-mode rgb_thermal \
-  --backend vllm \
-  --outdir ./benchmark_results
+pip install transformers pillow tqdm huggingface_hub
+pip install vllm
 ```
 
-### Evaluate only a fraction of images
+Optional / model-specific:
+
+```bash
+pip install bitsandbytes
+pip install accelerate
+```
+
+---
+
+## 3) Hugging Face Access (gated models)
+
+Some models (especially Llama vision models) may require HF auth:
+
+```bash
+huggingface-cli login
+```
+
+or export token:
+
+```bash
+export HUGGINGFACE_TOKEN="hf_xxx"
+```
+
+`run_all_evals.sh` includes a token-based login step for `llama3.2` runs.
+
+---
+
+## 4) Dataset Format Expectations
+
+Evaluator accepts:
+- Checkpoint-style JSON (`{"type":"checkpoint","items":...}`)
+- List-style JSON (`[{...}, {...}]`)
+
+Required per-row fields for evaluation:
+- `question_id`
+- `question`
+- `options` (non-empty list)
+- `gt_answer` (or `answer` in list-style)
+- `rgb_path` for modes `rgb`, `rgb_thermal`
+- `thermal_path` for modes `thermal`, `rgb_thermal`
+
+Optional:
+- `temp_summary` (`min`, `max`, `mean`, `top3_mean`)
+
+---
+
+## 5) Single-Run Usage (`eval_vlm_checkpoint.py`)
+
+Basic:
 
 ```bash
 python eval_vlm_checkpoint.py \
   --input ./response_v16 \
   --model qwen \
   --input-mode rgb_thermal \
-  --backend transformers \
-  --percent 0.1 \
   --outdir ./benchmark_results
 ```
 
-### MiniCPM with vLLM
+Common flags:
+- `--backend {transformers,vllm}`
+- `--repeat-prompt`
+- `--no-temp-summary`
+- `--percent 0.2`
+- `--dry-run`
+
+Example (ablation):
 
 ```bash
-python eval_vlm_checkpoint_minicpm.py \
+python eval_vlm_checkpoint.py \
   --input ./response_v16 \
-  --model minicpm \
-  --backend vllm \
-  --input-mode rgb_thermal \
-  --percent 0.1 \
-  --vllm-batch-size 1 \
+  --model qwen \
+  --backend transformers \
+  --input-mode thermal \
+  --repeat-prompt \
+  --no-temp-summary \
   --outdir ./benchmark_results
 ```
 
-### Dry run only
-
-Use this to verify dataset rows and file paths without loading model weights:
+Dry validation only:
 
 ```bash
 python eval_vlm_checkpoint.py \
   --input ./response_v16 \
   --model llava \
+  --input-mode rgb_thermal \
   --dry-run
 ```
 
-## Important evaluator options
+---
 
-Common CLI flags:
+## 6) Full Sweep Usage (`run_all_evals.sh`)
 
-- `--input` — input JSON file or directory of JSON files
-- `--model` — one of `llava`, `qwen`, `llama3.2`, `internvl2`, `minicpm`, `pixtral`
-- `--backend` — `transformers` or `vllm`
-- `--input-mode` — `rgb`, `thermal`, or `rgb_thermal`
-- `--percent` — sample fraction of unique images
-- `--outdir` — output directory for predictions and metrics
-- `--max-side` — image resize limit
-- `--max-new-tokens` — generation cap
-- `--repeat-prompt` — repeats the question after images to reduce lost-in-the-middle effects
-- `--no-temp-summary` — removes numeric temperature summary from the prompt
-- `--dry-run` — validate dataset and paths only
-
-vLLM-specific flags:
-- `--vllm-batch-size`
-- `--vllm-tensor-parallel-size`
-- `--vllm-gpu-memory-utilization`
-- `--vllm-max-model-len`
-- `--disable-vllm-prefix-caching`
-
-## Batch execution
-
-### Local sweep
-
-[run_all_evals.sh](run_all_evals.sh) runs ablation sweeps across:
-- models,
-- input modes,
-- repeated prompting,
-- temperature-summary inclusion/removal.
-
-Example:
+Make executable:
 
 ```bash
-bash run_all_evals.sh --percent 0.1 --model minicpm --input-mode rgb_thermal
+chmod +x run_all_evals.sh
 ```
 
-Useful options include:
-- `--dry-run`
-- `--input-dir <path>`
-- `--python-bin <executable>`
-- `--model <name|a,b,c>`
-- `--input-mode <mode|a,b,c>`
-- `--percent <0..1>`
-- `--outdir <path>`
-- `--repeat-prompt`
-- `--no-temp-summary`
+Default behavior:
+- Sweeps all 3 input modes
+- Sweeps repeat prompt ON/OFF
+- Sweeps temp summary ON/OFF
 
-### Slurm submission
+So per model: `3 × 2 × 2 = 12` runs.
 
-[submit_evals.sh](submit_evals.sh) generates a flat command map and submits a Slurm job array via [eval_array.slurm](eval_array.slurm).
+### Select model subset
 
 ```bash
-bash submit_evals.sh
+./run_all_evals.sh --model qwen
+./run_all_evals.sh --model llava,qwen
 ```
 
-## Output files
-
-Each run writes:
-
-1. **Predictions JSONL**
-   - one line per evaluated question
-   - includes model info, paths, question, options, ground truth, prediction, raw output, and errors
-
-2. **Metrics JSON**
-   - overall accuracy
-   - per-category accuracy
-   - bookkeeping about skipped rows, missing files, and exceptions
-
-Output filenames encode the run configuration, for example:
-
-```text
-eval_minicpm_openbmb_MiniCPM-V-2_6_backend-vllm_mode-rgb_thermal_maxside-768_maxtok-128_repeatprompt-0_notempsummary-0_p10_seed123_preds.jsonl
-```
-
-## Image path rewriting
-
-If dataset JSON files contain stale absolute image paths, use [update_response16_image_paths.py](update_response16_image_paths.py).
-
-It can:
-- replace old path prefixes recursively in JSON files,
-- validate every absolute path found in each JSON,
-- print missing or inaccessible files with error reasons.
-
-Example:
+### Force only repeat-prompt branch
 
 ```bash
-python update_response16_image_paths.py --root-dir ./response_v16
+./run_all_evals.sh --model qwen --repeat-prompt
 ```
 
-Validate without modifying files:
+Per model here: `3 × 1 × 2 = 6` runs.
+
+### Force only no-temp-summary branch
 
 ```bash
-python update_response16_image_paths.py --root-dir ./response_v16 --validate-only
+./run_all_evals.sh --model qwen --no-temp-summary
 ```
 
-## Notes on MiniCPM + vLLM
-
-MiniCPM support in this workspace uses a dedicated vLLM path with multimodal prompt placeholders and `multi_modal_data` requests.
-
-If you see vLLM initialization failures:
-- ensure only one heavy vLLM engine is running on the GPU,
-- reduce `--vllm-gpu-memory-utilization`,
-- set `--vllm-batch-size 1` for debugging,
-- try a dry run first to verify the dataset,
-- check that image paths are valid and readable.
-
-## Common issues
-
-### 1. Missing image files
-Run a dry run or use [update_response16_image_paths.py](update_response16_image_paths.py) to validate paths.
-
-### 2. Hugging Face gated model access
-For models such as Llama 3.2 Vision, authenticate first:
+### Dry-run sweep (no model inference)
 
 ```bash
-huggingface-cli login
+./run_all_evals.sh --dry-run --model qwen
 ```
 
-### 3. vLLM startup or cache errors on clusters
-This repo configures writable runtime cache directories under the output folder to avoid stale or inaccessible scratch/cache paths.
-
-### 4. Concurrent GPU usage
-Running multiple vLLM engines at once can cause startup failures or out-of-memory errors. Check active processes with:
+### Use specific Python env
 
 ```bash
-nvidia-smi
+./run_all_evals.sh --model qwen --python-bin /home/<user>/anaconda3/envs/flamevqa/bin/python
 ```
 
-## Results folders
+---
 
-Existing results are organized in folders such as:
-- [benchmark_results](benchmark_results)
-- [internvl2_results](internvl2_results)
-- [minicpm_results](minicpm_results)
-- [pixtral_results](pixtral_results)
+## 7) Output Files
 
-## License
+For each run, output files are written to `--outdir` with parameterized names:
 
-No license file is currently included in this repository. Add one if you plan to distribute the code publicly.
+- `*_preds.jsonl`: per-question predictions
+- `*_metrics.json`: aggregate metrics + run metadata
+- `*_dryrun.json`: dry-run validation report (if `--dry-run`)
+
+`metrics.json` includes:
+- `overall` accuracy
+- `by_category`
+- `run_config`
+- `more_info` (queue, skipped, exceptions, etc.)
+
+---
+
+## 8) Reproducibility Tips
+
+- Pin package versions before long experiments.
+- Keep a fixed `--seed` and `--percent` for fair ablations.
+- Use `--dry-run` before launching long sweeps.
+- Save terminal logs per run batch.
+
+---
+
+## 9) Troubleshooting
+
+### A) `ModuleNotFoundError` (torch/transformers/vllm)
+Install missing packages in the same Python env used for execution.
+
+### B) Llama + vLLM startup errors (`MllamaProcessor` / multimodal token issues)
+Use transformers backend for Llama runs:
+
+```bash
+python eval_vlm_checkpoint.py --model llama3.2 --backend transformers ...
+```
+
+### C) HF login fails but token is correct
+- Ensure token has model access scope.
+- Confirm model access is approved on Hugging Face.
+- Try explicit login in the same environment:
+
+```bash
+python -c "from huggingface_hub import login; login('hf_xxx')"
+```
+
+### D) Missing file skips
+Check `rgb_path` / `thermal_path` validity and relative vs absolute paths in JSON.
+
+---
+
+## 10) Recommended Workflow
+
+1. Validate combinations quickly:
+
+```bash
+./run_all_evals.sh --dry-run --model qwen
+```
+
+2. Run one short sample eval:
+
+```bash
+python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --percent 0.05 --outdir ./smoke_results
+```
+
+3. Launch full ablation sweep:
+
+```bash
+./run_all_evals.sh --model qwen
+```
+
+4. Compare `*_metrics.json` across runs for ablation analysis.
