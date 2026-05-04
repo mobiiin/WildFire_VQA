@@ -9,6 +9,9 @@ This repository contains a unified evaluation pipeline for multimodal VLM benchm
 
 - Kaggle: https://www.kaggle.com/datasets/caseypiere/wildfire-vqa
 - Hugging Face: https://huggingface.co/datasets/mobiiin/WildFire_VQA
+- FLAME-3: https://ieee-dataport.org/open-access/flame-3-radiometric-thermal-uav-imagery-wildfire-management
+- FLAME-2: https://ieee-dataport.org/open-access/flame-2-fire-detection-and-modeling-aerial-multi-spectral-image-dataset
+- FLAME-1: https://ieee-dataport.org/open-access/flame-dataset-aerial-imagery-pile-burn-detection-using-drones-uavs
 
 This project is open-source and the WildFire VQA dataset is publicly available on both platforms above.
 
@@ -263,3 +266,19 @@ python eval_vlm_checkpoint.py --input ./response_v16 --model qwen --percent 0.05
 ```
 
 4. Compare `*_metrics.json` across runs for ablation analysis.
+
+---
+
+## 11) How to Cite
+
+```bibtex
+@misc{habibpour2026wildfirevqalargescaleradiometricthermal,
+  title={WildFireVQA: A Large-Scale Radiometric Thermal VQA Benchmark for Aerial Wildfire Monitoring}, 
+  author={Mobin Habibpour and Niloufar Alipour Talemi and John Spodnik and Camren J. Khoury and Fatemeh Afghah},
+  year={2026},
+  eprint={2604.20190},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2604.20190}, 
+}
+```
